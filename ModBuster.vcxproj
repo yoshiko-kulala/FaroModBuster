@@ -129,6 +129,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>C:\Syncよしこ\12_SpesTech\業務\開発\01_M＆Y%27s\トンネル工事\開発記録\10_盤テスト用\ModBuster\libmodbus;C:\Program Files %28x86%29\Windows Kits\10\Include\10.0.22621.0\um;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>None</DebugInformationFormat>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
