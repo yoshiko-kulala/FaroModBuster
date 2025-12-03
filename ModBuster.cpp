@@ -1,326 +1,150 @@
-﻿#include <modbus.h>
-#include <iostream>
-#include <thread>
+﻿#include <iostream>
+#include <iomanip>
 #include <chrono>
-#include <windows.h>
-#include <sql.h>
-#include <sqlext.h>
-#include <ctime> // 現在時刻の取得
+#include <ctime>
+#include <cstdlib>      // system("cls")
+#include <cstdint>
 
-// SQLエラーメッセージを表示する関数
-void PrintSQLError(SQLHSTMT hStmt, SQLRETURN ret)
+extern "C" {
+#include "libmodbus/modbus.h"
+}
+
+static void print_registers(const uint16_t* regs, int start_addr, int count)
 {
-    SQLWCHAR sqlState[1024];
-    SQLWCHAR message[1024];
-    SQLINTEGER nativeError;
-    SQLSMALLINT textLength;
-    SQLSMALLINT i = 0;
+    constexpr int COLS = 8;  // 1 行あたりのレジスタ数（横方向）
+    int end_addr = start_addr + count;
 
-    // 全てのエラー情報を取得して表示
-    while (SQLGetDiagRecW(SQL_HANDLE_STMT, hStmt, ++i, sqlState, &nativeError, message, sizeof(message), &textLength) == SQL_SUCCESS)
-    {
-        std::wcerr << L"SQL Error " << i << L": " << message << L"\nSQL State: " << sqlState << std::endl;
-        std::wcerr << L"Native Error Code: " << nativeError << std::endl;
+    std::cout << "Holding Registers " << start_addr << " - " << (end_addr - 1)
+        << " (total " << count << ")\n\n";
+
+    for (int addr = start_addr; addr < end_addr; addr += COLS) {
+        // 行の先頭に先頭アドレスを表示
+        std::cout << std::setw(4) << addr << ": ";
+
+        for (int c = 0; c < COLS && (addr + c) < end_addr; ++c) {
+            int index = addr + c;  // libmodbus の mapping はアドレス = インデックス
+            std::cout << std::setw(6) << regs[index];
+        }
+        std::cout << '\n';
     }
 }
 
-// UiDisplayDataにデータを追加
-void InsertDataToUiDisplayTableWithPreviousValues(int fanWh)
+// 現在時刻を「YYYY-MM-DD HH:MM:SS」形式で出力するヘルパ
+static void print_now()
 {
-    SQLHENV hEnv;
-    SQLHDBC hDbc;
-    SQLHSTMT hStmt;
-    SQLRETURN ret;
-
-    // ODBCの初期化
-    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
-    SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0);
-    SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
-
-    // SQL Serverへの接続
-    SQLWCHAR connStr[] = L"Driver={SQL Server};Server=localhost\\SQLEXPRESS;Database=TestDatabase;Trusted_Connection=yes;";
-    ret = SQLDriverConnectW(hDbc, NULL, connStr, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL connection failed." << std::endl;
-        return;
-    }
-
-    // 直前の行のデータを取得
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
-
-    double previousValues[37] = { 0.0 }; // 全列分のデフォルト値を0で初期化
-
-    SQLWCHAR selectQuery[] = L"SELECT TOP 1 * FROM dbo.UiDisplayData ORDER BY id DESC";
-    ret = SQLPrepareW(hStmt, selectQuery, SQL_NTS);
-    if (ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO)
-    {
-        ret = SQLExecute(hStmt);
-        if (ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO)
-        {
-            if (SQLFetch(hStmt) == SQL_SUCCESS)
-            {
-                for (int i = 1; i <= 37; ++i) // idを除く全列を取得
-                {
-                    SQLGetData(hStmt, i + 1, SQL_C_DOUBLE, &previousValues[i - 1], sizeof(double), NULL);
-                }
-            }
-        }
-    }
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-
-    // fanWhを1000で割った値を計算
-    double cFanOutput1 = static_cast<double>(fanWh) / 1000.0;
-    previousValues[36] = cFanOutput1; // c-fan-output1に新しい値を設定
-
-    // UiDisplayDataに新しい行を挿入
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
-
-    SQLWCHAR insertQuery[] = L"INSERT INTO dbo.UiDisplayData "
-        L"([Lside10_dust], [Lside10_temp], [Lside10_humi], [Lside10_volt], "
-        L"[Lside30_dust], [Lside30_temp], [Lside30_humi], [Lside30_volt], "
-        L"[Lside50_dust], [Lside50_temp], [Lside50_humi], [Lside50_volt], "
-        L"[Rside10_dust], [Rside10_temp], [Rside10_humi], [Rside10_volt], "
-        L"[Rside30_dust], [Rside30_temp], [Rside30_humi], [Rside30_volt], "
-        L"[Rside50_dust], [Rside50_temp], [Rside50_humi], [Rside50_volt], "
-        L"[invert_dust], [invert_temp], [invert_humi], [invert_volt], "
-        L"[centru_dust], [centru_temp], [centru_humi], [centru_volt], "
-        L"[c-fan-output1], [CO2-reduction], [CO2-reduction-accum]) "
-        L"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
-
-    ret = SQLPrepareW(hStmt, insertQuery, SQL_NTS);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Prepare failed." << std::endl;
-        PrintSQLError(hStmt, ret);
-        return;
-    }
-
-    // パラメータのバインド
-    for (int i = 0; i < 37; ++i)
-    {
-        SQLBindParameter(hStmt, i + 1, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_FLOAT, 0, 0, &previousValues[i], 0, NULL);
-    }
-
-    // SQLクエリの実行
-    ret = SQLExecute(hStmt);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Execute failed." << std::endl;
-        PrintSQLError(hStmt, ret);
-    }
-    else
-    {
-        std::cout << "Inserted data into dbo.UiDisplayData with fanWh / 1000.0 = " << cFanOutput1 << "." << std::endl;
-    }
-
-    // ハンドルの解放
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    SQLDisconnect(hDbc);
-    SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+    using clock = std::chrono::system_clock;
+    auto now = clock::now();
+    std::time_t t = clock::to_time_t(now);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    localtime_s(&local_tm, &t);
+#else
+    local_tm = *std::localtime(&t);
+#endif
+    std::cout << "Last update: "
+        << std::put_time(&local_tm, "%Y-%m-%d %H:%M:%S")
+        << "\n\n";
 }
 
-
-// OutputTableから最新の値を読み取り、Modbusに書き込む
-void ReadOutputTableAndWriteToModbus(modbus_t* ctx)
+int main()
 {
-    SQLHENV hEnv;
-    SQLHDBC hDbc;
-    SQLHSTMT hStmt;
-    SQLRETURN ret;
-
-    // ODBCの初期化
-    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
-    SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0);
-    SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
-
-    // SQL Serverへの接続
-    SQLWCHAR connStr[] = L"Driver={SQL Server};Server=localhost\\SQLEXPRESS;Database=TestDatabase;Trusted_Connection=yes;";
-    ret = SQLDriverConnectW(hDbc, NULL, connStr, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL connection failed." << std::endl;
-        return;
-    }
-
-    // SQLステートメントを準備
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
-
-    // 最新の行（idが最大の行）を取得
-    SQLWCHAR sqlQuery[] = L"SELECT TOP 1 FanOutput, FilterOut, WasherOut FROM dbo.OutputTable ORDER BY id DESC";
-    ret = SQLPrepareW(hStmt, sqlQuery, SQL_NTS);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Prepare failed." << std::endl;
-        PrintSQLError(hStmt, ret);
-        return;
-    }
-
-    ret = SQLExecute(hStmt);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Execute failed." << std::endl;
-        PrintSQLError(hStmt, ret);
-        return;
-    }
-
-    int fanOutput = 0;
-    bool filterOut = false;
-    bool washerOut = false;
-
-    // 結果の取得
-    if (SQLFetch(hStmt) == SQL_SUCCESS)
-    {
-        SQLGetData(hStmt, 1, SQL_C_LONG, &fanOutput, sizeof(fanOutput), NULL);
-        SQLGetData(hStmt, 2, SQL_C_BIT, &filterOut, sizeof(filterOut), NULL);
-        SQLGetData(hStmt, 3, SQL_C_BIT, &washerOut, sizeof(washerOut), NULL);
-
-        // FanOutputを10倍にする
-        int fanOutputScaled = fanOutput * 10;
-
-        // Modbusに書き込む
-        if (modbus_write_register(ctx, 350, fanOutputScaled) == -1) {
-            std::cerr << "Failed to write FanOutputScaled to #350: " << modbus_strerror(errno) << std::endl;
-        }
-        if (modbus_write_register(ctx, 304, filterOut) == -1) {
-            std::cerr << "Failed to write FilterOut to #304: " << modbus_strerror(errno) << std::endl;
-        }
-        if (modbus_write_register(ctx, 300, washerOut) == -1) {
-            std::cerr << "Failed to write WasherOut to #300: " << modbus_strerror(errno) << std::endl;
-        }
-
-        std::cout << "FanOutput (original): " << fanOutput
-            << ", FanOutput (scaled): " << fanOutputScaled
-            << ", FilterOut: " << filterOut
-            << ", WasherOut: " << washerOut << std::endl;
-    }
-
-    // ハンドルの解放
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    SQLDisconnect(hDbc);
-    SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
-}
-
-
-// Modbusから読み取ったデータをSQLテーブルに挿入
-void InsertDataToSQL(int fanWh, bool filterFB, bool washerFB)
-{
-    SQLHENV hEnv;
-    SQLHDBC hDbc;
-    SQLHSTMT hStmt;
-    SQLRETURN ret;
-
-    // ODBCの初期化
-    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
-    SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0);
-    SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDbc);
-
-    // SQL Serverへの接続
-    SQLWCHAR connStr[] = L"Driver={SQL Server};Server=localhost\\SQLEXPRESS;Database=TestDatabase;Trusted_Connection=yes;";
-    ret = SQLDriverConnectW(hDbc, NULL, connStr, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL connection failed." << std::endl;
-        return;
-    }
-
-    // SQLステートメントを準備
-    SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
-
-    // SQLクエリ
-    SQLWCHAR sqlQuery[] = L"INSERT INTO dbo.ModbusInputData (FanWh, FilterFB, WasherFB) VALUES (?, ?, ?);";
-
-    ret = SQLPrepareW(hStmt, sqlQuery, SQL_NTS);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Prepare failed." << std::endl;
-        PrintSQLError(hStmt, ret); // エラーメッセージ表示
-        return;
-    }
-
-    // パラメータのバインド
-    SQLBindParameter(hStmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER, 0, 0, &fanWh, 0, NULL);
-    SQLBindParameter(hStmt, 2, SQL_PARAM_INPUT, SQL_C_BIT, SQL_BIT, 0, 0, &filterFB, 0, NULL);
-    SQLBindParameter(hStmt, 3, SQL_PARAM_INPUT, SQL_C_BIT, SQL_BIT, 0, 0, &washerFB, 0, NULL);
-
-    // SQLクエリの実行
-    ret = SQLExecute(hStmt);
-    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
-    {
-        std::cerr << "SQL Execute failed." << std::endl;
-        PrintSQLError(hStmt, ret); // エラーメッセージ表示
-    }
-
-    // ハンドルの解放
-    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
-    SQLDisconnect(hDbc);
-    SQLFreeHandle(SQL_HANDLE_DBC, hDbc);
-    SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
-}
-
-int main() {
-    // Modbus TCPのコンテキストを作成
-    modbus_t* ctx = modbus_new_tcp("127.0.0.1", 502);
-    //modbus_t* ctx = modbus_new_tcp("192.168.28.231", 502);
-    //modbus_t* ctx = modbus_new_tcp("192.168.28.232", 502);
+    // --- Modbus TCP スレーブ(サーバ)として初期化 ---
+    // 第1引数はバインドする IP。nullptr や "0.0.0.0" で全インターフェースにバインド
+    modbus_t* ctx = modbus_new_tcp(nullptr, 502);
     if (ctx == nullptr) {
-        std::cerr << "Unable to create the libmodbus context" << std::endl;
+        std::cerr << "Unable to create the libmodbus context\n";
         return -1;
     }
 
-    // PLCへの接続
-    if (modbus_connect(ctx) == -1) {
-        std::cerr << "Connection failed: " << modbus_strerror(errno) << std::endl;
-        modbus_free(ctx);
-        return -1;
-    }
-
-    // タイムアウトの設定
+    // レスポンスタイムアウト（お好みで）
     struct timeval timeout;
     timeout.tv_sec = 10;
     timeout.tv_usec = 0;
     modbus_set_response_timeout(ctx, timeout.tv_sec, timeout.tv_usec);
-    modbus_set_slave(ctx, 1); // デバイスIDを設定
 
-    // 定期的なModbusデータのチェック
-    while (true) {
-        uint16_t registers[2];
-        int fanWh = 0;
-        bool filterFB = false;
-        bool washerFB = false;
+    // スレーブ ID（必要に応じて）
+    modbus_set_slave(ctx, 1);
 
-        // #200, #201 から32ビットの値を読み取る
-        if (modbus_read_registers(ctx, 200, 2, registers) != -1) {
-            fanWh = (registers[0] << 16) | registers[1];
-            // UiDisplayDataにデータを挿入
-            InsertDataToUiDisplayTableWithPreviousValues(fanWh);
-        }
+    // --- レジスタマッピングを作成 ---
+    // coils, discrete inputs は使わないので 0。
+    // holding registers は 0〜399 の 400 個確保し、そのうち 200〜399 を表示に使用。
+    modbus_mapping_t* mb_mapping = modbus_mapping_new(
+        0,      // nb_coil_status
+        0,      // nb_input_status
+        400,    // nb_holding_registers
+        0       // nb_input_registers
+    );
 
-        // #302 からフィルタステータスを読み取る
-        uint16_t filterValue;
-        if (modbus_read_registers(ctx, 302, 1, &filterValue) != -1) {
-            filterFB = filterValue & 0x01;
-        }
-
-        // #304 から洗浄機ステータスを読み取る
-        uint16_t washerValue;
-        if (modbus_read_registers(ctx, 304, 1, &washerValue) != -1) {
-            washerFB = washerValue & 0x01;
-        }
-
-        // SQLにデータを挿入
-        InsertDataToSQL(fanWh, filterFB, washerFB);
-
-        // OutputTableから最新のデータを取得してModbusに書き込む
-        ReadOutputTableAndWriteToModbus(ctx);
-
-        // 1秒待機
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (mb_mapping == nullptr) {
+        std::cerr << "Failed to allocate the mapping: "
+            << modbus_strerror(errno) << "\n";
+        modbus_free(ctx);
+        return -1;
     }
 
-    // PLCとの接続を閉じる
+    // 初期値は 0 で OK（必要ならここで初期値を入れてもよい）
+    for (int i = 0; i < 400; ++i) {
+        mb_mapping->tab_registers[i] = 0;
+    }
+
+    // --- TCP リッスンソケットを作成 ---
+    int server_socket = modbus_tcp_listen(ctx, 1);  // 同時接続 1
+    if (server_socket == -1) {
+        std::cerr << "Unable to listen TCP: " << modbus_strerror(errno) << "\n";
+        modbus_mapping_free(mb_mapping);
+        modbus_free(ctx);
+        return -1;
+    }
+
+    std::cout << "Modbus TCP slave started on port 502.\n"
+        << "Waiting for master connection...\n";
+
+    // クエリバッファ
+    uint8_t query[MODBUS_TCP_MAX_ADU_LENGTH];
+
+    while (true) {
+        // クライアント接続を待つ
+        if (modbus_tcp_accept(ctx, &server_socket) == -1) {
+            std::cerr << "Failed to accept a connection: "
+                << modbus_strerror(errno) << "\n";
+            break;
+        }
+
+        std::cout << "Master connected.\n";
+
+        // この接続が続く限りリクエストを処理
+        while (true) {
+            int rc = modbus_receive(ctx, query);
+            if (rc == -1) {
+                std::cerr << "Connection closed or error: "
+                    << modbus_strerror(errno) << "\n";
+                break;  // 接続終了 → 次のクライアント待ちへ
+            }
+
+            // 受信したリクエストに対して応答、書き込み要求なら mb_mapping が更新される
+            if (modbus_reply(ctx, query, rc, mb_mapping) == -1) {
+                std::cerr << "Failed to send reply: "
+                    << modbus_strerror(errno) << "\n";
+                break;
+            }
+
+            // --- ここで 200〜399 の 200レジスタを画面に表示 ---
+            // 画面クリアして毎回「状態ビュー」を作り直す
+            system("cls");
+
+            print_now();
+            print_registers(mb_mapping->tab_registers, 200, 200);
+
+            std::cout << "\n(PC is Modbus TCP slave. "
+                "Master can read/write registers 0–399; "
+                "this view shows 200–399 only.)\n";
+        }
+
+        std::cout << "Master disconnected. Waiting for new connection...\n";
+    }
+
+    // 後片付け（通常はここまで来ないが念のため）
+    modbus_mapping_free(mb_mapping);
     modbus_close(ctx);
     modbus_free(ctx);
 
